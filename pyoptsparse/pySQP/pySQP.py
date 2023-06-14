@@ -47,8 +47,11 @@ class SQP(Optimizer):
     @staticmethod
     def _getInforms():
         informs = {
-            0: "Failed",
-            1: "Succedded",
+            -1: "Setup failed",
+            0: "Succedded",
+            10: "Iteration limit exceeded",
+            20: "Hessian approx became not positive semi-definite",
+            30: "Line search failed",
         }
         return informs
 
@@ -135,6 +138,10 @@ class SQP(Optimizer):
         self._setInitialCacheValues()
         blx, bux, xs = self._assembleContinuousVariables()
         self._setSens(sens, sensStep, sensMode)
+
+        # TODO: currently, the variables bound blx, bux are ignored
+        if np.min(np.abs(blx)) < 1e10 or np.min(np.abs(bux)) < 1e10:
+            print("\n*** Warning: SQP currently ignores variable bounds ***\n")
 
         # setup constraint Jacobian
         indices, blc, buc, fact = self.optProb.getOrdering(["ne", "le", "ni", "li"], oneSided=True)
