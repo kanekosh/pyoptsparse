@@ -126,9 +126,9 @@ class SQP(Optimizer):
 
         if len(optProb.constraints) == 0:
             self.unconstrained = True
-            # TODO: activate dummy constraint?
+            # TODO: activate dummy constraint here?
             # optProb.dummyConstraint = True
-            raise NotImplementedError("SQP currently only supports constrained problems")
+            # TODO: allow unconstrained problem at wrapper level (it's supported in SQP core level)
 
         # Save the optimization problem and finalize constraint
         self.optProb = optProb
@@ -139,19 +139,11 @@ class SQP(Optimizer):
         blx, bux, xs = self._assembleContinuousVariables()
         self._setSens(sens, sensStep, sensMode)
 
-        # TODO: currently, the variables bound blx, bux are ignored
-        if np.min(np.abs(blx)) < 1e10 or np.min(np.abs(bux)) < 1e10:
-            print("\n*** Warning: SQP currently ignores variable bounds ***\n")
-
         # setup constraint Jacobian
-        indices, blc, buc, fact = self.optProb.getOrdering(["ne", "le", "ni", "li"], oneSided=True)
+        indices, blc, buc, fact = self.optProb.getOrdering(["ne", "le", "ni", "li"], oneSided=False)
         self.optProb.jacIndices = indices
         self.optProb.fact = fact
         self.optProb.offset = buc
-
-        # ---!!!--- SQP currently only supports equality ---!!!---
-        if not np.allclose(blc, buc, 1e-10, 1e-10):
-            raise NotImplementedError("My SQP does not support inequality constraints")
 
         # We make a split here: If the rank is zero we setup the
         # problem and run SQP, otherwise we go to the waiting loop:
@@ -198,8 +190,13 @@ class SQP(Optimizer):
 
             timeA = time.time()
 
+            # print('X_LB:', blx)
+            # print('X_UB:', bux)
+            # print('C_LB:', blc)
+            # print('C_UB:', buc)
+
             # setup and run SQP
-            sqp = SQPmain(nx=self.optProb.ndvs, nh=self.optProb.nCon, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, grad_cons=eval_cons_jac)
+            sqp = SQPmain(nx=self.optProb.ndvs, nc=self.optProb.nCon, x_lb=blx, x_ub=bux, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, jac_cons=eval_cons_jac, cons_lb=blc, cons_ub=buc)
             x_opt, obj_opt, status = sqp.optimize(xs)
 
             optTime = time.time() - timeA
