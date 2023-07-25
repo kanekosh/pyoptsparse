@@ -48,7 +48,7 @@ class SQP(Optimizer):
     def _getInforms():
         informs = {
             -1: "Setup failed",
-            0: "Succedded",
+            0: "Succeeded",
             10: "Iteration limit exceeded",
             20: "Hessian approx became not positive semi-definite",
             30: "Line search failed",
@@ -143,7 +143,7 @@ class SQP(Optimizer):
         indices, blc, buc, fact = self.optProb.getOrdering(["ne", "le", "ni", "li"], oneSided=False)
         self.optProb.jacIndices = indices
         self.optProb.fact = fact
-        self.optProb.offset = buc
+        self.optProb.offset = np.zeros(len(indices))
 
         # We make a split here: If the rank is zero we setup the
         # problem and run SQP, otherwise we go to the waiting loop:
