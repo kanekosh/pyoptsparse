@@ -52,6 +52,7 @@ class SQP(Optimizer):
             10: "Iteration limit exceeded",
             20: "Hessian approx became not positive semi-definite",
             30: "Line search failed",
+            40: "QP solver failed"
         }
         return informs
 
