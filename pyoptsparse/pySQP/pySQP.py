@@ -52,7 +52,8 @@ class SQP(Optimizer):
             10: "Iteration limit exceeded",
             20: "Hessian approx became not positive semi-definite",
             30: "Line search failed",
-            40: "QP solver failed"
+            40: "QP solver failed",
+            50: "Elastic mode failed"
         }
         return informs
 
@@ -198,6 +199,7 @@ class SQP(Optimizer):
 
             # setup and run SQP
             sqp = SQPmain(nx=self.optProb.ndvs, nc=self.optProb.nCon, x_lb=blx, x_ub=bux, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, jac_cons=eval_cons_jac, cons_lb=blc, cons_ub=buc)
+            sqp.setup_options(self.options)
             x_opt, obj_opt, status = sqp.optimize(xs)
 
             optTime = time.time() - timeA
