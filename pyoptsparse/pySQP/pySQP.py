@@ -16,9 +16,6 @@ from ..pyOpt_optimizer import Optimizer
 from ..pyOpt_utils import ICOL, INFINITY, IROW, convertToCOO, extractRows, scaleRows
 
 # import SQP optimizer
-import os
-import sys
-sys.path.append('/Users/shugo/rsrc/SQP/')
 from sqp import SQP as SQPmain
 
 
@@ -132,7 +129,7 @@ class SQP(Optimizer):
             # optProb.dummyConstraint = True
             # TODO: allow unconstrained problem at wrapper level (it's supported in SQP core level)
 
-        # Save the optimization problem and finalize constraint
+        # Save the optimization problem and finalize constraints
         self.optProb = optProb
         self.optProb.finalize()
         # Set history/hotstart
@@ -141,11 +138,25 @@ class SQP(Optimizer):
         blx, bux, xs = self._assembleContinuousVariables()
         self._setSens(sens, sensStep, sensMode)
 
-        # setup constraint Jacobian
-        indices, blc, buc, fact = self.optProb.getOrdering(["ne", "le", "ni", "li"], oneSided=False)
+        # --- setup constraint ---
+        # nonlinear constraints
+        nonl_indices, _, _, nonl_fact = self.optProb.getOrdering(["ne", "ni"], oneSided=False)
+        nnCon = len(nonl_indices)   # number of nonlinear constraints
+        # TODO (FFR): we could let eval_cons compute the nonlinear constraints only, and provide linear constraints separately to SQP.
+        # To do so, use the following lines
+        # self.optProb.jacIndices = indices
+        # self.optProb.fact = fact
+        # self.optProb.offset = np.zeros_like(fact)
+
+        # nonlinear constraints + linear constraints (in that order)
+        indices, blc, buc, fact = self.optProb.getOrdering(["ne", "ni", "le", "li"], oneSided=False)
         self.optProb.jacIndices = indices
         self.optProb.fact = fact
         self.optProb.offset = np.zeros(len(indices))
+        # NOTE: eval_cons returns all nonlinear and linear constraints in order of [nonlinear, linear]
+
+        # print('Number of nonlinear constraints:', nnCon)
+        # print('Number of linear constraints:', len(indices) - nnCon)
 
         # We make a split here: If the rank is zero we setup the
         # problem and run SQP, otherwise we go to the waiting loop:
@@ -198,8 +209,8 @@ class SQP(Optimizer):
             # print('C_UB:', buc)
 
             # setup and run SQP
-            sqp = SQPmain(nx=self.optProb.ndvs, nc=self.optProb.nCon, x_lb=blx, x_ub=bux, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, jac_cons=eval_cons_jac, cons_lb=blc, cons_ub=buc)
-            sqp.setup_options(self.options)
+            sqp = SQPmain(nx=self.optProb.ndvs, nc=self.optProb.nCon, x_lb=blx, x_ub=bux, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, jac_cons=eval_cons_jac, cons_lb=blc, cons_ub=buc, n_nonl_cons=nnCon)
+            sqp.set_options(self.options)
             x_opt, obj_opt, status = sqp.optimize(xs)
 
             optTime = time.time() - timeA
