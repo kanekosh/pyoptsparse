@@ -16,7 +16,7 @@ from ..pyOpt_optimizer import Optimizer
 from ..pyOpt_utils import ICOL, INFINITY, IROW, convertToCOO, extractRows, scaleRows
 
 # import SQP optimizer
-from sqp import SQP as SQPmain
+from .sqp import SQP as SQPmain
 
 
 class SQP(Optimizer):
