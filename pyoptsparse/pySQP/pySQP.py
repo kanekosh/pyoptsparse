@@ -209,8 +209,7 @@ class SQP(Optimizer):
             # print('C_UB:', buc)
 
             # setup and run SQP
-            sqp = SQPmain(nx=self.optProb.ndvs, nc=self.optProb.nCon, x_lb=blx, x_ub=bux, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, jac_cons=eval_cons_jac, cons_lb=blc, cons_ub=buc, n_nonl_cons=nnCon)
-            sqp.set_options(self.options)
+            sqp = SQPmain(nx=self.optProb.ndvs, nc=self.optProb.nCon, x_lb=blx, x_ub=bux, obj=eval_obj, grad_obj=eval_obj_grad, cons=eval_cons, jac_cons=eval_cons_jac, cons_lb=blc, cons_ub=buc, n_nonl_cons=nnCon, options=self.options)
             x_opt, obj_opt, status = sqp.optimize(xs)
 
             optTime = time.time() - timeA

@@ -57,21 +57,27 @@ class SQP():
         subject to: h(x) =  0
                     g(x) <= 0
 
-                    where g = [(cons_lb - c), (c - cons_ub), (x_lb - x), (x - x_ub), dummy]
-                    and   g_nonl := [(cons_lb - c), (c - cons_ub)] (nonlinear part)
-                          g_lin  := [(x_lb - x), (x - x_ub)] (linear part)
+                    where h = [h_nonl; h_lin]
+                          g = [g_nonl; g_lin; dummy]
+                    and   h_nonl := [c_nonl(x) - c_val]   (nonlinear equalities)
+                          h_lin  := [c_lin(x)  - c_val]     (linear equalities)
+                          g_nonl := [(cons_lb - c_nonl), (c_nonl - cons_ub)] (nonlinear inequalities)
+                          g_lin  := [(cons_lb - c_lin) , (c_lin  - cons_ub), (x_lb - x), (x - x_ub)] (linear inequalities)
+                    NOTE: the order is important. All nonlinear constraints must come first in g.
+                    TODO: what about the dummy nonlinear constraints?
 
     Elastic problem is:
         min:        f(x) + gamma * (sum(v + w) + sum(z))
         w.r.t.:     x, v, w, z
                     (new variable is defined as xvwz = [x, v, w, z])
-        subject to: h - v + w = 0
+        subject to: h_nonl - v + w = 0
+                    h_lin = 0
                     g_nonl - z <= 0
-                    x_lb <= x <= x_ub
+                    g_lin <= 0      (this includes x bounds)
                     v, w, z >= 0
     The constraints are reformatted as:
-                    h_elastic = h - v + w = 0
-                    g_elastic = [g_nonl - z, g_lin, -v, -w, -z] <= 0
+                    h_elastic = [h_nonl - v + w; h_lin] = 0
+                    g_elastic = [g_nonl - z    ; g_lin; -v; -w; -z] <= 0
 
     Exit status:
          -1: not started
@@ -84,7 +90,7 @@ class SQP():
 
     """
 
-    def __init__(self, nx, nc, x_lb, x_ub, obj, grad_obj, cons=None, jac_cons=None, cons_lb=None, cons_ub=None, n_nonl_cons=None):
+    def __init__(self, nx, nc, x_lb, x_ub, obj, grad_obj, cons=None, jac_cons=None, cons_lb=None, cons_ub=None, n_nonl_cons=None, options={}):
         """
         Sequential Quadratic Programming (SQP) algorithm.
 
@@ -117,12 +123,14 @@ class SQP():
             Number of nonlinear constraints. If None, it is assumed that all constraints are nonlinear (i.e., later we set n_nonl_cons = nc).
             Otherwise, the constraint `cons` should be ordered by [c_nonl, c_lin].
             I.e., c[0:n_nonl_cons] are nonlinear, and c[n_nonl_cons:] are linear.
+        options : dict
+            User-defined options.
 
         TODO: automatically fix (reshape) constraints and Jacobian when nh=1 or ng=1.
         """
 
-        # set default options
-        self.set_options()
+        # set options
+        self._set_options(options)
 
         # flag for elastic mode
         self.elastic_mode = False
@@ -139,32 +147,44 @@ class SQP():
         if cons_ub is not None:
             cons_ub = _convert_array_largeval_to_None(cons_ub)
 
+        # --- setup constraints ---
+        # initialize dict that includes all constraints info
+        self.con_info = {}
+        # con_info[type][linearity][info]
+        # type: 'eq' or 'ineq_lb' or 'ineq_ub' or 'x_lb' or 'x_ub'
+        # linearity: 'lin' or 'nonl'
+        # info: 'idx' or 'val'
+        #   'idx': list of constraint indices (or eq or ineq) or variable indices
+        #   'val': values of constraints or variable bound
+        for con_types in ['eq', 'ineq_lb', 'ineq_ub', 'x_lb', 'x_ub']:
+            self.con_info[con_types] = {}
+            for linearity in ['lin', 'nonl']:
+                self.con_info[con_types][linearity] = {}
+                self.con_info[con_types][linearity]['idx'] = []
+                self.con_info[con_types][linearity]['val'] = []
+
         # setup variable bounds as inequality constraints
-        self.x_lb = x_lb
-        self.x_ub = x_ub
-        self.x_lb_idx = []   # list of variable indices that has a lower bound. This will be imposed as x_lb - x <= 0
-        self.x_lb_val = []
-        self.x_ub_idx = []   # list of variable indices that has a upper bound. This will be imposed as x - x_ub <= 0
-        self.x_ub_val = []
         for i in range(nx):
             if x_lb[i] is not None:
-                self.x_lb_idx.append(i)
-                self.x_lb_val.append(x_lb[i])
+                # add lower bound
+                self.con_info['x_lb']['lin']['idx'].append(i)
+                self.con_info['x_lb']['lin']['val'].append(x_lb[i])
             if x_ub[i] is not None:
-                self.x_ub_idx.append(i)
-                self.x_ub_val.append(x_ub[i])
+                # add upper bound
+                self.con_info['x_ub']['lin']['idx'].append(i)
+                self.con_info['x_ub']['lin']['val'].append(x_ub[i])
         # END FOR (adding variable bounds)
-        # Jacobian of bound constraints
-        self.jac_x_lb = -np.eye(nx)[self.x_lb_idx, :]
-        self.jac_x_ub = np.eye(nx)[self.x_ub_idx, :]
+        num_x_lb = len(self.con_info['x_lb']['lin']['idx'])
+        num_x_ub = len(self.con_info['x_ub']['lin']['idx'])
 
-        # setup constraints
-        self.con_eq_idx = []   # constraint indices for equalities: c_val - c(x) = 0
-        self.con_eq_val = []   # equality value
-        self.con_ineq_lb_idx = []  # constraint indices for inequalities with lower bound: c_lb - c(x) <= 0
-        self.con_ineq_lb_val = []  # lower bound value
-        self.con_ineq_ub_idx = []  # constraint indices for inequalities with upper bound: c(x) - c_ub <= 0
-        self.con_ineq_ub_val = []  # upper bound value
+        # Jacobian of bound constraints
+        self.con_info['x_lb']['jac'] = -np.eye(nx)[self.con_info['x_lb']['lin']['idx'], :]
+        self.con_info['x_ub']['jac'] = np.eye(nx)[self.con_info['x_ub']['lin']['idx'], :]
+
+        # convert linear constraints into "nonlinear" if specified by options.
+        # this means that originally-linear constraints will be (1) included in linear search and (2) relaxed in elastic mode.
+        if self.options['ignore_linear_constraints']:
+            n_nonl_cons = nc
 
         # flag to classify problem characteristics
         self.flag_unconstrained = False    # uncon & unbounded
@@ -172,7 +192,7 @@ class SQP():
         self.flag_inequality_only = False  # no equalities, with (non-bound) inequalities
         self.flag_equality_only = False    # no inequalities and bounds
 
-        if cons is None and len(self.x_lb_idx) == 0 and len(self.x_ub_idx) == 0:
+        if cons is None and num_x_lb == 0 and num_x_ub == 0:
             # unconstrainted & unbounded problem.
             print('\n*** Unconstrained & unbounded problem. Setting up dummy constraints.')
             self.flag_unconstrained = True
@@ -180,10 +200,10 @@ class SQP():
             # setup dummy constraints (one equality and one inequality) that are always feasible
             self._cons_func = lambda x: np.array([0., -1.])
             self._jac_cons_func = lambda x: np.zeros((2, nx))
-            self.con_eq_idx.append(0)
-            self.con_eq_val.append(0.)
-            self.con_ineq_ub_idx.append(1)
-            self.con_ineq_ub_val.append(0.)
+            self.con_info['eq']['nonl']['idx'].append(0)
+            self.con_info['eq']['nonl']['val'].append(0.)
+            self.con_info['ineq_ub']['nonl']['idx'].append(1)
+            self.con_info['ineq_ub']['nonl']['val'].append(0.)
 
         elif cons is None:
             # only bound constraints
@@ -191,17 +211,23 @@ class SQP():
             self.flag_bounds_only = True
             self._cons_func = lambda x: np.array([0.])
             self._jac_cons_func = lambda x: np.zeros((1, nx))
-            self.con_eq_idx.append(0)
-            self.con_eq_val.append(0.)
+            self.con_info['eq']['nonl']['idx'].append(0)
+            self.con_info['eq']['nonl']['val'].append(0.)
 
         else:
+            # set functions
             self._cons_func = cons
             self._jac_cons_func = jac_cons
 
-            # TODO (FFR): check/save constraint linearity here
-
             # loop over each constraint, and judge if it is equality or inequality
             for i in range(nc):
+                # check if this constraint is specified as linear
+                if i >= n_nonl_cons:
+                    linearity = 'lin'
+                else:
+                    linearity = 'nonl'
+
+                # check the type of constraint[i] and add it to the dict
                 if cons_lb[i] is None and cons_ub[i] is None:
                     pass
                 
@@ -209,27 +235,31 @@ class SQP():
                     # add an equality constraint
                     if cons_lb[i] is not None and cons_ub[i] is not None:
                         if np.isclose(cons_lb[i], cons_ub[i], atol=1e-10):
-                            self.con_eq_idx.append(i)
-                            self.con_eq_val.append(cons_lb[i])
+                            self.con_info['eq'][linearity]['idx'].append(i)
+                            self.con_info['eq'][linearity]['val'].append(cons_lb[i])
                             continue
                     
                     # otherwise, add an inequality constraint. Handle lower and upper bounds separately
                     if cons_lb[i] is not None:
-                        self.con_ineq_lb_idx.append(i)
-                        self.con_ineq_lb_val.append(cons_lb[i])
+                        self.con_info['ineq_lb'][linearity]['idx'].append(i)
+                        self.con_info['ineq_lb'][linearity]['val'].append(cons_lb[i])
                     if cons_ub[i] is not None:
-                        self.con_ineq_ub_idx.append(i)
-                        self.con_ineq_ub_val.append(cons_ub[i])
-            # END FOR (adding inequality)
+                        self.con_info['ineq_ub'][linearity]['idx'].append(i)
+                        self.con_info['ineq_ub'][linearity]['val'].append(cons_ub[i])
+            # END FOR (add constraints)
         # END IF (constraints setup)
 
         # problem dimensions
         self.nx = copy.deepcopy(nx)   # number of variables
-        self.nh = len(self.con_eq_idx)   # number of equality constraints
-        self.ng = len(self.con_ineq_lb_idx) + len(self.con_ineq_ub_idx) + len(self.x_lb_idx) + len(self.x_ub_idx)   # number of inequality constraints
-        self.ng_nonl = len(self.con_ineq_lb_idx) + len(self.con_ineq_ub_idx)   # number of nonlinear inequlities. NOTE/TODO (FFR): assumes that given constraints are all nonlinear
+        self.nh_lin = len(self.con_info['eq']['lin']['idx'])   # number of linear equalities
+        self.nh_nonl = len(self.con_info['eq']['nonl']['idx'])   # nonlinear equalities
+        self.nh = self.nh_lin + self.nh_nonl   # all equalities
+        self.ng_lin = len(self.con_info['ineq_lb']['lin']['idx']) + len(self.con_info['ineq_ub']['lin']['idx'])   # linear inequalities
+        self.ng_nonl = len(self.con_info['ineq_lb']['nonl']['idx']) + len(self.con_info['ineq_ub']['nonl']['idx'])   # nonlinear inequalities
+        self.ng_bound = len(self.con_info['x_lb']['lin']['idx']) + len(self.con_info['x_ub']['lin']['idx'])   # variable bounds
+        self.ng = self.ng_lin + self.ng_nonl + self.ng_bound   # all inequalities
         # elastic problem dimensions
-        self.nx_e = nx + 2 * self.nh + self.ng_nonl   # number of variables in elastic mode
+        self.nx_e = nx + (2 * self.nh_nonl) + self.ng_nonl   # number of variables in elastic mode. 2 elastic variables for each nonlinear equality, 1 for each nonlinear inequality
         # NOTE: nh and ng_nonl remains the same in elastic mode
         
         # if necessary, we need to add a setup dummy constraint in the constraint function call (because the algorithm needs at least one equality and one inequality)
@@ -248,11 +278,19 @@ class SQP():
         # TODO: dummy constraint + elastic mode. need to change nh and ng here?
 
         print('\n--- number of constraints (including dummy and bounds, all one-sided) ---')
-        print('equality   h:', self.nh)
-        print('inequality g:', self.ng, '| breakdown:', len(self.con_ineq_lb_idx), 'con LBs,', len(self.con_ineq_ub_idx), 'con UBs,', len(self.x_lb_idx), 'var LBs,', len(self.x_ub_idx), 'var UBs\n')
+        print('equality h:', self.nh)
+        print('    nonlinear:', self.nh_nonl)
+        print('    linear:   ', self.nh_lin)
+        print('inequality g:', self.ng)
+        print('    nonlinear con LBs:', len(self.con_info['ineq_lb']['nonl']['idx']))
+        print('    nonlinear con UBs:', len(self.con_info['ineq_ub']['nonl']['idx']))
+        print('    linear con LBs:   ', len(self.con_info['ineq_lb']['lin']['idx']))
+        print('    linear con UBs:   ', len(self.con_info['ineq_ub']['lin']['idx']))
+        print('    variable LBs:     ', len(self.con_info['x_lb']['lin']['idx']))
+        print('    variable UBs:     ', len(self.con_info['x_ub']['lin']['idx']), '\n')
        
         # initialize penalty parameters for merit function. This will be updated during optimization
-        self.rho = np.zeros(self.nh + self.ng_nonl)  # different penality value for each nonlinear constraint. rho = [rho_h, rho_g_nonl]
+        self.rho = np.zeros(self.nh_nonl + self.ng_nonl)  # different penality value for each nonlinear constraint. rho = [rho_h, rho_g_nonl]
         self.delta_rho = 1.   # damping factor for penality parameter update
         self.rho_increase_count = 0
         self.rho_decrease_count = 0
@@ -282,7 +320,7 @@ class SQP():
         # initilize exit status
         self.exit_status = -1
 
-    def set_options(self, options_user={}):
+    def _set_options(self, options_user={}):
         """
         Setup optimization options.
 
@@ -312,6 +350,9 @@ class SQP():
         self.options['ls_backtrack_shrink_ratio'] = 0.3   # shrink factor for backtracking line search
         self.options['ls_backtrack_maxiter'] = 10         # max iterations for backtracking line search
         self.options['ls_backtrack_c1'] = 1e-5            # sufficient decrease parameter for backtracking line search
+
+        # linear constraints
+        self.options['ignore_linear_constraints'] = True   # If True, treat all linear constraints as nonlinear (expect bounds, which will be always treated as linear)
 
         # elastic mode
         self.options['elastic_weight'] = 1.e5   # initial elastic weight gamma
@@ -357,7 +398,7 @@ class SQP():
 
         # normalization (same as SNOPT)
         gNorm = np.linalg.norm(dfdx, ord=1) / np.sqrt(len(dfdx))   # approx. 2-norm of objective gradient
-        lag_multi_nonl = np.concatenate((lam, sig[:self.ng_nonl]))   # all nonlinear lagrange multipliers = all multipliers except for bound constraints (Note that I currenly don't support linear non-bound constraints yet). TODO: change this if I support linear non-bound constraints. SNOPT uses non-bound linear multipliers here.
+        lag_multi_nonl = np.concatenate((lam, sig[:self.ng_nonl + self.ng_lin]))   # all lagrange multipliers except the ones for bound constraints (Note: SNOPT uses non-bound linear multipliers here.)
         if len(lag_multi_nonl) > 0:
             piNorm = max(np.linalg.norm(lag_multi_nonl, ord=np.inf), 1)
         else:
@@ -406,14 +447,18 @@ class SQP():
             self.con_cache['c'] = c
 
             # equality constraints h = 0
-            self.con_cache['h'] = c[self.con_eq_idx] - self.con_eq_val
+            h_nonl = c[self.con_info['eq']['nonl']['idx']] - self.con_info['eq']['nonl']['val']
+            h_lin = c[self.con_info['eq']['lin']['idx']] - self.con_info['eq']['lin']['val']
+            self.con_cache['h'] = np.concatenate((h_nonl, h_lin))
 
             # inequality constraints g <= 0 (including variable bounds)
-            g_lb = self.con_ineq_lb_val - c[self.con_ineq_lb_idx]
-            g_ub = c[self.con_ineq_ub_idx] - self.con_ineq_ub_val
-            x_lb = self.x_lb_val - x[self.x_lb_idx]
-            x_ub = x[self.x_ub_idx] - self.x_ub_val
-            self.con_cache['g'] = np.concatenate((g_lb, g_ub, x_lb, x_ub))
+            g_nonl_lb = self.con_info['ineq_lb']['nonl']['val'] - c[self.con_info['ineq_lb']['nonl']['idx']]
+            g_nonl_ub = c[self.con_info['ineq_ub']['nonl']['idx']] - self.con_info['ineq_ub']['nonl']['val']
+            g_lin_lb = self.con_info['ineq_lb']['lin']['val'] - c[self.con_info['ineq_lb']['lin']['idx']]
+            g_lin_ub = c[self.con_info['ineq_ub']['lin']['idx']] - self.con_info['ineq_ub']['lin']['val']
+            x_lb = self.con_info['x_lb']['lin']['val'] - x[self.con_info['x_lb']['lin']['idx']]
+            x_ub = x[self.con_info['x_ub']['lin']['idx']] - self.con_info['x_ub']['lin']['val']
+            self.con_cache['g'] = np.concatenate((g_nonl_lb, g_nonl_ub, g_lin_lb, g_lin_ub, x_lb, x_ub))
 
             # add dummy constraints if necessary
             if self.flag_inequality_only:
@@ -436,12 +481,16 @@ class SQP():
             self.con_Jac_cache['dc/dx'] = dcdx
 
             # Jacobian of equalities
-            self.con_Jac_cache['dh/dx'] = dcdx[self.con_eq_idx, :]
+            jac_h_nonl = dcdx[self.con_info['eq']['nonl']['idx'], :]
+            jac_h_lin = dcdx[self.con_info['eq']['lin']['idx'], :]
+            self.con_Jac_cache['dh/dx'] = np.concatenate((jac_h_nonl, jac_h_lin), axis=0)
 
             # Jacobian of inequalities
-            jac_g_lb = -dcdx[self.con_ineq_lb_idx, :]
-            jac_g_ub = dcdx[self.con_ineq_ub_idx, :]
-            self.con_Jac_cache['dg/dx'] = np.concatenate((jac_g_lb, jac_g_ub, self.jac_x_lb, self.jac_x_ub), axis=0)
+            jac_g_nonl_lb = -dcdx[self.con_info['ineq_lb']['nonl']['idx'], :]
+            jac_g_nonl_ub = dcdx[self.con_info['ineq_ub']['nonl']['idx'], :]
+            jac_g_lin_lb = -dcdx[self.con_info['ineq_lb']['lin']['idx'], :]
+            jac_g_lin_ub = dcdx[self.con_info['ineq_ub']['lin']['idx'], :]
+            self.con_Jac_cache['dg/dx'] = np.concatenate((jac_g_nonl_lb, jac_g_nonl_ub, jac_g_lin_lb, jac_g_lin_ub, self.con_info['x_lb']['jac'], self.con_info['x_ub']['jac']), axis=0)
 
             # add dummy constraints if necessary
             if self.flag_inequality_only:
@@ -460,12 +509,12 @@ class SQP():
     # ------------------------------------
     def _unpack_linesearh_var(self, v):
         """
-        Unpack line search variable v = [x, lam, sig_nonl, slack_nonl]
+        Unpack line search variable v = [x, lam_nonl, sig_nonl, slack_nonl]
         """
         x = v[:self.nx]
-        lam = v[self.nx : self.nx + self.nh]
-        sig = v[self.nx + self.nh : self.nx + self.nh + self.ng_nonl]
-        slack = v[self.nx + self.nh + self.ng_nonl:]
+        lam = v[self.nx : self.nx + self.nh_nonl]
+        sig = v[self.nx + self.nh_nonl : self.nx + self.nh_nonl + self.ng_nonl]
+        slack = v[self.nx + self.nh_nonl + self.ng_nonl:]
         
         return x, lam, sig, slack
         
@@ -488,10 +537,11 @@ class SQP():
 
         f = self._obj(x)
         h, g = self._cons(x)
-        rho_h = self.rho[:self.nh]
-        rho_g = self.rho[self.nh:]   # this is only for g_nonl
+        rho_h = self.rho[:self.nh_nonl]
+        rho_g = self.rho[self.nh_nonl:]   # this is only for g_nonl
 
-        # merit function includes nonlinear constraints only. equality h is (assumed to be) all nonlinear
+        # merit function includes nonlinear constraints only.
+        h = h[:self.nh_nonl]
         g = g[:self.ng_nonl]
 
         phi = f + np.dot(lam, h) + np.dot(sig, g + slack) + 0.5 * (np.dot(rho_h * h, h) + np.dot(rho_g * (g + slack), g + slack))
@@ -521,9 +571,11 @@ class SQP():
         h, g = self._cons(x)
         dfdx = self._obj_grad(x)
         dhdx, dgdx = self._cons_jac(x)
-        rho_h = self.rho[:self.nh]
-        rho_g = self.rho[self.nh:]
+        rho_h = self.rho[:self.nh_nonl]
+        rho_g = self.rho[self.nh_nonl:]
 
+        h = h[:self.nh_nonl]
+        dhdx = dhdx[:self.nh_nonl, :]
         g = g[:self.ng_nonl]
         dgdx = dgdx[:self.ng_nonl, :]
 
@@ -542,9 +594,9 @@ class SQP():
         dmdv = self._merit_func_grad(v)
 
         # sanity check on the shape of v and dmdv
-        if len(v) != self.nx + self.nh + 2 * self.ng_nonl:
+        if len(v) != self.nx + self.nh_nonl + 2 * self.ng_nonl:
             raise RuntimeError('v has wrong shape')
-        if len(dmdv) != self.nx + self.nh + 2 * self.ng_nonl:
+        if len(dmdv) != self.nx + self.nh_nonl + 2 * self.ng_nonl:
             raise RuntimeError('dmerit/dv has wrong shape')
 
         # finite difference
@@ -648,7 +700,7 @@ class SQP():
         else:
             nx = self.nx
         # END IF
-        
+
         if self.elastic_mode:
             # solve QP corresponding to elastic problem, which should be always feasible.
             # augment Hessian with 0s (because elastic variables are linear and their 2nd derivs are 0)
@@ -656,22 +708,28 @@ class SQP():
             H_elastic[:self.nx, :self.nx] = H
             H = H_elastic
             # augment dfdx, dhdx ,dgdx for augmented variable x := [x, v, w, z]
-            dfdv = self.gamma * np.ones(self.nh)
-            dfdw = self.gamma * np.ones(self.nh)
+            dfdv = self.gamma * np.ones(self.nh_nonl)
+            dfdw = self.gamma * np.ones(self.nh_nonl)
             dfdz = self.gamma * np.ones(self.ng_nonl)
             dfdx = np.concatenate((dfdx, dfdv, dfdw, dfdz))   # shape (nx_e)
 
-            dhdx = np.concatenate((dhdx, -np.eye(self.nh), np.eye(self.nh), np.zeros((self.nh, self.ng_nonl))), axis=1)   # [dh/dx, dh/dv=eye, dh/dw=eye, dh/dz=0]
+            dhdx_nonl = dhdx[:self.nh_nonl, :]
+            dhdx_lin = dhdx[self.nh_nonl:, :]
+            # derivatives of h_elastic = [h_nonl - v + w; h_lin] w.r.t. [x, v, w, z]
+            dhdx_nonl_elastic = np.concatenate((dhdx_nonl, -np.eye(self.nh_nonl), np.eye(self.nh_nonl), np.zeros((self.nh_nonl, self.ng_nonl))), axis=1)   # [dh/dx, dh/dv=-eye, dh/dw=eye, dh/dz=0] for nonlinear h
+            dhdx_lin_elastic = np.concatenate((dhdx_lin, np.zeros((self.nh_lin, 2 * self.nh_nonl + self.ng_nonl))), axis=1)   # [dh/dx, dh/dv=0, dh/dw=0, dh/dz=0] for linear h
+            dhdx = np.concatenate((dhdx_nonl_elastic, dhdx_lin_elastic), axis=0)   # shape (nh, nx_e)
     
-            g = np.concatenate((g, np.zeros(self.nh * 2 + self.ng_nonl)))   # shape (ng_e)
+            g = np.concatenate((g, np.zeros(self.nh_nonl * 2 + self.ng_nonl)))   # shape (ng_e). Needs to augment g with v, w, z bounds. Set v0 = w0 = z0 = 0 here.
             dgdx_nonl = dgdx[:self.ng_nonl, :]
             dgdx_lin = dgdx[self.ng_nonl:, :]
-            dgdx_nonl_elastic = np.concatenate((dgdx_nonl, np.zeros((self.ng_nonl, self.nh)), np.zeros((self.ng_nonl, self.nh)), -np.eye(self.ng_nonl)), axis=1)   # [dg_nonl/dx, dg_nonl/dv=0, dg_nonl/dw=0, dg_nonl/dz]
-            dgdx_lin_elastic = np.concatenate((dgdx_lin, np.zeros((self.ng - self.ng_nonl, 2 * self.nh + self.ng_nonl))), axis=1)   # [dg_lin/dx, dg_lin/dv=0, dg_lin/dw=0, dg_lin/dz=0]
+            # derivatives of g_elastic := [g_nonl - z; g_lin] w.r.t. [x, v, w, z]. g_lin includes x bounds
+            dgdx_nonl_elastic = np.concatenate((dgdx_nonl, np.zeros((self.ng_nonl, 2 * self.nh_nonl)), -np.eye(self.ng_nonl)), axis=1)        # [dg_nonl/dx, dg_nonl/dv=0, dg_nonl/dw=0, dg_nonl/dz]
+            dgdx_lin_elastic = np.concatenate((dgdx_lin, np.zeros((self.ng_lin + self.ng_bound, 2 * self.nh_nonl + self.ng_nonl))), axis=1)   # [dg_lin/dx,  dg_lin/dv =0, dg_lin/dw =0, dg_lin/dz=0]
             # for bounds on v, w, z
-            dgdx_v_elastic = np.concatenate((np.zeros((self.nh, self.nx)), -np.eye(self.nh), np.zeros((self.nh, self.nh)), np.zeros((self.nh, self.ng_nonl))), axis=1)   # [dx=0, dgdv, dw=0, dz=0]
-            dgdx_w_elastic = np.concatenate((np.zeros((self.nh, self.nx)), np.zeros((self.nh, self.nh)), -np.eye(self.nh), np.zeros((self.nh, self.ng_nonl))), axis=1)   # [dx=0, dv=0, dgdw, dz=0]
-            dgdx_z_elastic = np.concatenate((np.zeros((self.ng_nonl, self.nx)), np.zeros((self.ng_nonl, self.nh)), np.zeros((self.ng_nonl, self.nh)), -np.eye(self.ng_nonl)), axis=1)   # [dx=0, dv=0, dw=0, dgdz]
+            dgdx_v_elastic = np.concatenate((np.zeros((self.nh_nonl, self.nx)), -np.eye(self.nh_nonl), np.zeros((self.nh_nonl, self.nh_nonl)), np.zeros((self.nh_nonl, self.ng_nonl))), axis=1)   # [dx=0, dgdv, dw=0, dz=0]
+            dgdx_w_elastic = np.concatenate((np.zeros((self.nh_nonl, self.nx)), np.zeros((self.nh_nonl, self.nh_nonl)), -np.eye(self.nh_nonl), np.zeros((self.nh_nonl, self.ng_nonl))), axis=1)   # [dx=0, dv=0, dgdw, dz=0]
+            dgdx_z_elastic = np.concatenate((np.zeros((self.ng_nonl, self.nx)), np.zeros((self.ng_nonl, self.nh_nonl)), np.zeros((self.ng_nonl, self.nh_nonl)), -np.eye(self.ng_nonl)), axis=1)   # [dx=0, dv=0, dw=0, dgdz]
 
             dgdx = np.concatenate((dgdx_nonl_elastic, dgdx_lin_elastic, dgdx_v_elastic, dgdx_w_elastic, dgdx_z_elastic), axis=0)
         # END IF (elastic QP formulation)
@@ -800,8 +858,8 @@ class SQP():
         """
 
         # form line search variables v := [x, lam, sig_nonl, slack_nonl] and p_v := [p_x, p_lam, p_sig_nonl, p_slack_nonl]
-        v0 = np.concatenate((x, lam, sig[:self.ng_nonl], slack[:self.ng_nonl]))
-        p_v = np.concatenate((p_x, p_lam, p_sig[:self.ng_nonl], p_slack[:self.ng_nonl]))
+        v0 = np.concatenate((x, lam[:self.nh_nonl], sig[:self.ng_nonl], slack[:self.ng_nonl]))
+        p_v = np.concatenate((p_x, p_lam[:self.nh_nonl], p_sig[:self.ng_nonl], p_slack[:self.ng_nonl]))
 
         ### line search derivatives check
         ### self.__merit_func_derivatives_check(v0)
@@ -826,6 +884,9 @@ class SQP():
         h, g = self._cons(x)
 
         # use only nonlinear constraints
+        h = h[:self.nh_nonl]
+        lam = lam[:self.nh_nonl]
+        p_lam = p_lam[:self.nh_nonl]
         g = g[:self.ng_nonl]
         sig = sig[:self.ng_nonl]
         p_sig = p_sig[:self.ng_nonl]
@@ -1033,7 +1094,7 @@ class SQP():
         # update slack variables for the next iteration.
         slack = np.maximum(-g, 0.)
         # Here, nonlinear slacks are adjusted to minimize the merit function as a function of s, as described in Gill 1986, Eq. (2.8)
-        rho_g_nonl = self.rho[self.nh:]
+        rho_g_nonl = self.rho[self.nh_nonl:]
         rho_non0_idx = rho_g_nonl > 0
         slack[:self.ng_nonl][rho_non0_idx] = np.maximum(-g[:self.ng_nonl][rho_non0_idx] - sig[:self.ng_nonl][rho_non0_idx] / rho_g_nonl[rho_non0_idx > 0], 0.)
 
@@ -1119,7 +1180,7 @@ class SQP():
         lam = np.zeros(self.nh)   # for equalities
         sig = np.zeros(self.ng)   # for inequalities
 
-        # compute nonlinear slack (Gill 1986, Eq. 2.8). Slack will be used only in the line search, and this replaces g <= 0 with g + s = 0 with s >= 0.
+        # compute slacks (Gill 1986, Eq. 2.8). Slack will be used only in the line search, and this replaces g <= 0 with g + s = 0 with s >= 0.
         slack = self._compute_slack(g, sig)
 
         # gradient of Lagrangian
@@ -1337,7 +1398,7 @@ class SQP():
                 H = np.eye(self.nx) * scaler   # NOTE: this does not necessarily help
             
             # log major iteration history. discard elastic variables
-            self.major_hist.append({'x': x[:self.nx], 'f': f, 'h': h, 'g': g[:self.ng], 'flag_elastic': self.elastic_mode, 'opt_inf': optimality, 'opt_l2': opt_l2, 'feas': feasibility})
+            self.major_hist.append({'x': x, 'f': f, 'h': h, 'g': g, 'flag_elastic': self.elastic_mode, 'opt_inf': optimality, 'opt_l2': opt_l2, 'feas': feasibility})
 
             # increment iteration counter
             k += 1
