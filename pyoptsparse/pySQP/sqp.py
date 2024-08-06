@@ -1,8 +1,11 @@
 import numpy as np
 from scipy.optimize import line_search as scipy_line_search
 import copy
+import time as time_package
 
 import cvxpy
+import qpsolvers
+from .qp_active_set import qp as qp_active_set
 
 from scipy.optimize._linesearch import LineSearchWarning
 import warnings
@@ -24,6 +27,8 @@ TODO: dummy constraints are not yet implemented in elastic mode. Therefore, the 
 - bound-only
 - inequality-only
 - equality-only
+
+# TODO: refactoring: move function wrapper into another class?
 """
 
 def _convert_array_largeval_to_None(array):
@@ -295,6 +300,9 @@ class SQP():
         self.rho_increase_count = 0
         self.rho_decrease_count = 0
 
+        # initialize active set for QP
+        self.active_set = None
+
         # initialize caches (to avoid duplicated calls on functions and gradient/Jacobian)
         self.f_cache = {'x': np.ones(nx) * 1e100, 'f': 0.}
         self.f_grad_cache = {'x': np.ones(nx) * 1e100, 'df/dx': np.zeros(nx)}
@@ -339,7 +347,7 @@ class SQP():
 
         # Hessian approximation
         self.options['hessian_reset_freq'] = 100   # reset Hessian every this many iterations
-        self.options['hessian_definite_tol'] = 1e-8   # tolerance for checking positive definiteness of Hessian approximation
+        self.options['hessian_definite_tol'] = 1e-10   # tolerance for checking positive definiteness of Hessian approximation
         self.options['hessian_initial_scaler'] = 1.0   # apply this scaling factor to H = I at iteration 0.  # TODO: scale this with |g|?
         self.options['hessian_correction_for_identity'] = False   # If True, apply the scaler to H = I based on the curvature information after taking the step and before the next BFGS update (Eq. 6.20 of Nocedal)
         
@@ -765,8 +773,9 @@ class SQP():
             p_lam = p[nx:]
 
         else:
-            # inequality-constrained problem. Solve the QP iteratively via CVXPY
-
+            # inequality-constrained problem.
+            """
+            # --- solve SQP via CVXPY ---
             # formulate QP
             x = cvxpy.Variable(nx)
             obj = cvxpy.Minimize(0.5 * cvxpy.quad_form(x, H, assume_PSD=True) + dfdx.T @ x)
@@ -786,9 +795,12 @@ class SQP():
                             'MSK_DPAR_INTPNT_QO_TOL_PFEAS': 1e-10,   # primal feasibility tolerance
                             }
             try:
+                t_start = time_package.time()
                 ### qp.solve(solver='CVXOPT', verbose=False, max_iters=1000, abstol=1e-8, reltol=1e-8, feastol=1e-8)
                 ### qp.solve(solver='MOSEK', verbose=False, mosek_params=mosek_params)
                 qp.solve(solver='GUROBI', verbose=False, Threads=self.options['num_threads'])
+                t_end = time_package.time()
+                print('QP solver time (cvxpy):', t_end - t_start)
             except cvxpy.error.SolverError:
                 print('   - WARNING: QP solver failed. (cvxpy.error.SolverError)')
                 return None, None, None, None, False
@@ -819,6 +831,95 @@ class SQP():
             # print('p_lam', p_lam)
             # print('p_sig', p_sig)
             # print('p_slack', p_slack)
+            """
+
+            # --- solve QP via qpsolvers ---
+            if self.flag_inequality_only or self.flag_bounds_only:
+                # no linear equality constraints
+                qp_prob = qpsolvers.Problem(H, dfdx, G=dgdx, h=-g)
+            else:
+                qp_prob = qpsolvers.Problem(H, dfdx, G=dgdx, h=-g, A=dhdx, b=-h)
+
+            try:
+                # TODO: set initial guess
+                t_start = time_package.time()
+                qp_sol = qpsolvers.solve_problem(qp_prob, solver='gurobi', initvals=np.zeros(nx))
+                t_end = time_package.time()
+                print('QP solver time (qpsolver):', t_end - t_start)
+            except qpsolvers.SolverNotFound as e:
+                print('   - WARNING: QP solver failed. (qpsolvers.SolverNotFound)')
+                print(e)
+                return None, None, None, None, False
+            except Exception as e:
+                print('   - WARNING: QP solver failed. (qpsolvers other error)')
+                print(e)
+                return None, None, None, None, False
+
+            if not qp_sol.found:
+                # QP failed to find a solution
+                print('   - WARNING: QP solver failed (qp_sol.found = False).')
+                return None, None, None, None, False
+
+            p_x = qp_sol.x[:self.nx]
+
+            if self.flag_inequality_only or self.flag_bounds_only:
+                p_lam = np.zeros(self.nh)
+            else:
+                p_lam = qp_sol.y - lam
+            
+            if self.flag_equality_only:
+                p_sig = np.zeros(self.ng)
+                p_slack = np.zeros(self.ng)
+            else:
+                p_sig = qp_sol.z[:self.ng] - sig
+                # compute slack
+                slack_new = -(dgdx[:self.ng, :self.nx] @ p_x + g[:self.ng])
+                p_slack = slack_new[:self.ng] - slack
+
+            # print('--- qpsolvers ---')
+            # print('p_x', p_x)
+            # print('p_lam', p_lam)
+            # print('p_sig', p_sig)
+            # print('p_slack', p_slack)
+            # """
+
+            # --- solve QP via in-house active-set solver ---
+            if self.flag_inequality_only or self.flag_bounds_only:
+                # no linear equality constraints
+                dhdx = np.array([])
+                h = np.array([])
+
+            if self.elastic_mode:
+                # need a little hack to elastic mode Hessian (which include 0 block due to linear elastic variables)
+                # to make it strictly positive definite
+                elastic_vars_idx = range(self.nx, self.nx_e)
+                H[elastic_vars_idx, elastic_vars_idx] += 1e-8
+            
+            t_start = time_package.time()
+            p_x, lam_qp, sig_qp, self.active_set = qp_active_set(H, dfdx, dhdx, h, dgdx, g, np.zeros(nx), self.active_set)
+            t_end = time_package.time()
+            print('QP solver time (active set):', t_end - t_start)
+            
+            if self.flag_inequality_only or self.flag_bounds_only:
+                p_lam = np.zeros(self.nh)
+            else:
+                p_lam = lam_qp - lam
+            
+            if self.flag_equality_only:
+                p_sig = np.zeros(self.ng)
+                p_slack = np.zeros(self.ng)
+            else:
+                p_sig = sig_qp[:self.ng] - sig
+                # compute slack
+                slack_new = -(dgdx[:self.ng, :self.nx] @ p_x + g[:self.ng])
+                p_slack = slack_new[:self.ng] - slack
+            
+            # print('--- active-set ---')
+            # print('p_x', p_x)
+            # print('p_lam', p_lam)
+            # print('p_sig', p_sig)
+            # print('p_slack', p_slack)
+            # """
         # END IF
 
         return p_x, p_lam, p_sig, p_slack, True
@@ -1243,13 +1344,13 @@ class SQP():
 
             # check if the Hessian is positive definite
             min_eval = np.min(np.linalg.eig(H)[0])
-            if min_eval < -self.options['hessian_definite_tol']:   # relax a little bit
+            if min_eval < self.options['hessian_definite_tol']:   # relax a little bit
                 print('   - WARNING: Hessian approximation is not positive definite! Minimum eval of Hessian =', min_eval)
                 ### self.exit_status = 20
                 ### break
 
                 # reset Hessian to be positive definite
-                if np.min(np.diag(H)) >= -self.options['hessian_definite_tol']:
+                if np.min(np.diag(H)) >= self.options['hessian_definite_tol']:
                     # reset to diagonal matrix, which is positive definite
                     H = self._reset_Hessian(mode='diag', H=H)
                 else:
