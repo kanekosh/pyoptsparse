@@ -132,6 +132,7 @@ class SQP():
             Number of nonlinear constraints. If None, it is assumed that all constraints are nonlinear (i.e., later we set n_nonl_cons = nc).
             Otherwise, the constraint `cons` should be ordered by [c_nonl, c_lin].
             I.e., c[0:n_nonl_cons] are nonlinear, and c[n_nonl_cons:] are linear.
+            # TODO: better take a list of [True, False] indicating constraint linearlity?
         options : dict
             User-defined options.
 
