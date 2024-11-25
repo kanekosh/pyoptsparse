@@ -3,8 +3,12 @@ from scipy.optimize import line_search as scipy_line_search
 import copy
 import time as time_package
 
+# QP solvers
 import cvxpy
 import qpsolvers
+from qpoases import PySQProblem as SQProblem
+from qpoases import PyOptions as Options
+from qpoases import PyPrintLevel as PrintLevel
 from .qp_active_set import qp as qp_active_set
 
 from scipy.optimize._linesearch import LineSearchWarning
@@ -325,8 +329,19 @@ class SQP():
         self.con_Jac_hist = []   # all constraint Jacobian calls
         self.major_hist = []   # major iteration history
 
-        # initilize exit status
+        # initialize exit status
         self.exit_status = -1
+
+        # initialize qpOASES instances and options
+        # TODO: exclude bounds here?
+        self.qp_prob = SQProblem(self.nx, self.nh_lin + self.nh_nonl + self.ng_lin + self.nh_nonl + self.ng_bound)   # provide number of variables and constraints (excluding bounds)
+        self.qp_init_solved = False
+        self.qp_prob_elastic = None   # TODO
+        self.qp_elastic_init_solved = False
+
+        options = Options()
+        options.printLevel = PrintLevel.LOW
+        self.qp_prob.setOptions(options)
 
     def _set_options(self, options_user={}):
         """
@@ -705,6 +720,7 @@ class SQP():
         # get problem dimensions. nx and ng changes depending on the NLP mode (normal or elastic). nh remains unchanged
         if self.elastic_mode:
             nx = self.nx_e
+            ### raise NotImplementedError('Elastic mode not implemented yet for qpOASES')
         else:
             nx = self.nx
         # END IF
@@ -774,7 +790,7 @@ class SQP():
 
         else:
             # inequality-constrained problem.
-            """
+            # """
             # --- solve SQP via CVXPY ---
             # formulate QP
             x = cvxpy.Variable(nx)
@@ -831,8 +847,9 @@ class SQP():
             # print('p_lam', p_lam)
             # print('p_sig', p_sig)
             # print('p_slack', p_slack)
-            """
+            # """
 
+            """
             # --- solve QP via qpsolvers ---
             if self.flag_inequality_only or self.flag_bounds_only:
                 # no linear equality constraints
@@ -877,12 +894,66 @@ class SQP():
                 p_slack = slack_new[:self.ng] - slack
 
             # print('--- qpsolvers ---')
-            # print('p_x', p_x)
-            # print('p_lam', p_lam)
-            # print('p_sig', p_sig)
-            # print('p_slack', p_slack)
-            # """
+            # print('p_x', list(p_x))
+            # print('p_lam', list(p_lam))
+            # print('p_sig', list(p_sig))
+            # print('p_slack', list(p_slack))
 
+            # --- solve QP via qpOASES ---
+            if self.elastic_mode:
+                raise NotImplementedError('Elastic mode not implemented yet for qpOASES')
+            # TODO: following only works for non-elastic mode
+            con_mat = np.concatenate((dhdx, dgdx), axis=0)  # shape (nh + ng, nx)
+            con_lb = np.concatenate((-h, -1e20 * np.ones(self.ng)), axis=0)  # shape (nh + ng,)
+            con_ub = np.concatenate((-h, -g), axis=0)  # shape (nh + ng,)
+            x_lb = -1e20 * np.ones(self.nx)
+            x_ub = 1e20 * np.ones(self.nx)
+            n_WSR = np.array([10000])  # max number of working set recalculations
+
+            # TODO: more efficient to provide variable bounds (lb, ub) directly instead of them as inequality constraints g?
+            t_start = time_package.time()
+            if not self.qp_init_solved:
+                print('qpOASES: initial solve.')
+                self.qp_prob.init(H, dfdx, con_mat, x_lb, x_ub, con_lb, con_ub, n_WSR)
+                self.qp_init_solved = True
+            else:
+                # hotstart
+                self.qp_prob.hotstart(H, dfdx, con_mat, x_lb, x_ub, con_lb, con_ub, n_WSR)
+            t_end = time_package.time()
+            print('QP solver time (qpOASES):', t_end - t_start)
+            """
+
+            """
+            # NOTE: memory error in the following block when I get some results...
+            # get QP solution
+            p_x = np.zeros(self.nx)
+            self.qp_prob.getPrimalSolution(p_x)
+            dual = np.zeros_like(con_lb)
+            self.qp_prob.getDualSolution(dual)
+
+            if self.flag_inequality_only or self.flag_bounds_only:
+                p_lam_WRONG = np.zeros(self.nh)
+            else:
+                p_lam_WRONG = dual[:self.nh] - lam   # multiplier step for equality constraints
+            
+            if self.flag_equality_only:
+                p_sig = np.zeros(self.ng)
+                p_slack = np.zeros(self.ng)
+            else:
+                p_sig_WRONG = dual[self.nh:] - sig    # multiplier step for inequality constraints
+                # compute slack
+                slack_new = -(dgdx[:self.ng, :self.nx] @ p_x + g[:self.ng])
+                p_slack = slack_new[:self.ng] - slack
+
+            # print('--- qpOASES ---')
+            # print('p_x', list(p_x))
+            # print('p_lam', list(p_lam))
+            # print('p_sig', list(p_sig))
+            # print('p_slack', list(p_slack))
+            # TODO: primal solution (p_x) and slack is correct, but multipliers (lam and sig) doesn't match the qpsolver's solutions!!
+            """
+
+            """
             # --- solve QP via in-house active-set solver ---
             if self.flag_inequality_only or self.flag_bounds_only:
                 # no linear equality constraints
@@ -893,7 +964,7 @@ class SQP():
                 # need a little hack to elastic mode Hessian (which include 0 block due to linear elastic variables)
                 # to make it strictly positive definite
                 elastic_vars_idx = range(self.nx, self.nx_e)
-                H[elastic_vars_idx, elastic_vars_idx] += 1e-8
+                ### H[elastic_vars_idx, elastic_vars_idx] += 1e-8   # regularization
             
             t_start = time_package.time()
             p_x, lam_qp, sig_qp, self.active_set = qp_active_set(H, dfdx, dhdx, h, dgdx, g, np.zeros(nx), self.active_set)

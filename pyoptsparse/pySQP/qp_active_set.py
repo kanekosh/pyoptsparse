@@ -1,11 +1,10 @@
 """
 Active-set QP solver
 Implements Algorithm 5.4 from Martins and Ning, Engineering Design Optimization
-
-TODO: implement linear-feasible problem as phase 1
 """
 
 import numpy as np
+from scipy.linalg import null_space, cho_factor, cho_solve
 import qpsolvers
 
 def _check_linear_indep(A, Cw):
@@ -98,10 +97,23 @@ def qp(Q, q, A, b, C, d, x0, W=None):
     n_eq = len(b)  # number of equality constraints
     n_ineq = len(d)  # number of inequality constraints
 
+    # modify shape of the constraint matrices
+    if n_eq == 0:
+        A = np.empty((0, nx))
+    if n_ineq == 0:
+        C = np.empty((0, nx))
+
     # --- sanity check: Q matrix must be positive semi-definite ---
     min_eval = np.min(np.linalg.eig(Q)[0])
-    if min_eval <= 0.0:   # relax a little bit
-        raise ValueError('QP ERROR: Q matrix is not positive semi-definite. Min eval=', min_eval)
+    if min_eval <= -1e-10:   # relax a little bit
+        raise ValueError('QP ERROR: Q matrix is not positive (semi-)definite. Min eval=', min_eval)
+
+    # check if Q is strictly positive definite
+    if min_eval < 1e-14:
+        print('WARNING: Q matrix is not strictly positive definite. This may cause numerical issues.')
+        flag_semidef = True
+    else:
+        flag_semidef = False
 
     # --- check if initial point is feasible ---
     if n_eq > 0:
@@ -135,10 +147,17 @@ def qp(Q, q, A, b, C, d, x0, W=None):
                 remove_cons_count += 1
             print(f'Removed {remove_cons_count} constraints from the initial working set to make it linear independent')
 
+    # TODO: the reduced Hessian for the initial working set should be positive definite - may need to remove bound constraints from linear variables to achieve this!
+    #       Or we might need "temporary" constraints to achieve this. See page 6 of Gill 1991 (Inertia-controlling methods)
     # --- QP main loop ---
     
     for k in range(k_max):
         # --- solve KKT system for the current working set ---
+        # Eq. (5.81) from the MDO book (Martins and Ning)
+        # NOTE: This approach fails when Q matrix is singular (this happens in the elastic mode where Q is semi-definite due to linear elastic variables)
+        #       One workaround would be regularizing Q matrix by adding small value to the diagonal to make it positive definite.
+        #       Also, this approach is not very efficient because np.linalg.solve does not exploit the symmetric structure of the KKT matrix.
+        #       More advanced methods like null-space method can be more efficient?
         kkt_dim = nx + n_eq + len(W)
 
         mat = np.zeros((kkt_dim, kkt_dim))
@@ -153,11 +172,40 @@ def qp(Q, q, A, b, C, d, x0, W=None):
         rhs = np.zeros(kkt_dim)
         rhs[:nx] = -q - np.dot(Q.T, xk)
 
-        sol = np.linalg.solve(mat, rhs)
+        if not flag_semidef:
+            sol = np.linalg.solve(mat, rhs)
+        else:
+            # Q matrix is semi-definite, hense the KKT matrix is singular. We cannot solve the KKT system directly.
+            # Find a search direction by solving mat @ [p; lambda; sigma] = 0 for non-zero solution.
+            raise NotImplementedError('Q matrix is semi-definite, so we need some sort of modification to solve the KKT system. This is not implemented yet.')
+
         p = sol[:nx]
         lam = sol[nx:nx + n_eq]   # multipliers for equality constraints
         sig = np.zeros(n_ineq)
         sig[W] = sol[nx + n_eq:]   # multipliers for inequality constraints. Non-active constraints will have sig=0
+
+        # --- null-space method ---
+        # # TODO: null-space is empty when con_mat is shape (n, n). In that case I can just solve con_mat @ (x + p) = b directly?
+        # rhs = q + np.dot(Q.T, xk)
+        # con_mat = np.vstack((A, C[W, :]))
+        # Z = null_space(con_mat)
+        # # solve reduced-Hessian linear system by Cholesky factorization
+        # reduced_Hessian = np.dot(Z.T, np.dot(Q, Z))
+        # reduced_rhs = -np.dot(Z.T, rhs)
+        # pz = cho_solve(cho_factor(reduced_Hessian), reduced_rhs)   # NOTE: this is `dz` in Gill 2005
+        # p_NULL = np.dot(Z, pz)  # step for x
+        # # compute Lagrange multipliers by solving Eq. (16.20) from Nocedal
+        # Y = null_space(Z.T)  # given Z of shape (n, n-m), Y is of shape (n, m) such that [Y|Z] is non-singular. See Nocedal Ch 16.2
+        # mat_for_lambda = np.dot(con_mat, Y).T
+        # rhs_for_lambda = -np.dot(Y.T, rhs + np.dot(Q, p))
+        # lagrange_multipliers = np.linalg.solve(mat_for_lambda, rhs_for_lambda)
+        
+        # lam_NULL = lagrange_multipliers[:n_eq]
+        # sig_NULL = np.zeros(n_ineq)
+        # sig_NULL[W] = lagrange_multipliers[n_eq:]   # multipliers for inequality constraints. Non-active constraints will have sig=0
+
+        # print('\n\n\n---')
+        # --- end of null-space method ---
 
         if np.linalg.norm(p) < tol:
             if np.all(sig >= 0):
@@ -173,6 +221,7 @@ def qp(Q, q, A, b, C, d, x0, W=None):
         
         else:   # (p != 0)
             # determine the step size such that non-working set constraints are satisfied
+            # NOTE: when the reduced Hessian is indefinite, alpha can be greater than 1.0
             non_W = list(set(range(n_ineq)) - set(W))   # list of non-working set indices
             C_non_W = C[non_W, :]
 
